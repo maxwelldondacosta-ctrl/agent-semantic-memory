@@ -1,0 +1,2 @@
+fastembed>=0.3
+graphql-core>=3.2  # optional: only for the query_memory tool

@@ -1,6 +1,6 @@
 # agent-semantic-memory
 
-Local, no-server semantic memory for [Claude Code](https://claude.com/claude-code) sessions.
+Local, no-network semantic memory for [Claude Code](https://claude.com/claude-code) sessions.
 
 ## The problem
 
@@ -82,20 +82,91 @@ pre-LLM-call hook — the only framework-specific parts are the input/output
 contract (what shape the hook receives on stdin, what shape it must return)
 and where that framework stores its own transcripts.
 
+## Letting the model look things up itself
+
+Passive injection only knows what the user typed. The model is the one who
+finds out, halfway through an answer, that it needs a boss's HP or a rule
+decided three sessions ago, and models rarely admit "I don't remember".
+They fill the gap. Three pieces cover that:
+
+1. **A `recall` tool** (`memory_server.py`, an MCP server). The model can
+   search all of memory whenever it is unsure. When nothing matches, the
+   tool says "No record found" and tells the model not to guess. That gives
+   it an honest answer that is cheaper than inventing one. Once per session
+   and compaction, the prompt hook reminds the model that the tool exists
+   and that memory exists beyond what it can see.
+2. **Canon** (`remember` / `forget`). Settled facts such as lore, names,
+   stats and rules are stored as one authoritative entry per topic.
+   Remembering a topic again replaces the old fact, so a rebalance can't
+   leave two conflicting HP values side by side. Results label canon as
+   `CANON`.
+3. **A check after every reply** (`verify_hook.py`, a `Stop` hook). This
+   covers the cases where the model won't admit it is unsure. It reads the
+   finished reply and picks out sentences that lean on the past ("as we
+   decided", "earlier", "we named") or hedge ("I think", "if I recall",
+   "I don't remember"). It then looks those sentences up:
+   - If memory holds records the model has not seen in this context, it
+     hands them back once and asks the model to correct itself to the user
+     if anything conflicts.
+   - If memory has no record at all of something the reply asserts, it
+     asks the model to present it as a suggestion, not established fact.
+     Sentences that propose things ("should", "let's", "maybe") are left
+     alone.
+
+   It never fires twice in a row (`stop_hook_active`). Records that the
+   model just recalled, or that the hook already showed, are not repeated.
+
+### Structured queries (GraphQL)
+
+Game canon is a graph: a boss lives somewhere, drops something, belongs to a
+faction. Each fact also has a history, meaning the conversation where it was
+decided. `query_memory` runs GraphQL (`memory_graphql.py`) over the same
+store, so the model can follow those links in one call:
+
+```graphql
+{
+  canon(topic: "Vargan") {
+    fact
+    links { relation direction target { topic recorded fact } }
+    discussedIn(limit: 2) {
+      excerpt
+      turn { timestamp before(count: 1) { text } }
+    }
+  }
+}
+```
+
+`remember` takes links (`"lives in: Frost Caverns"`), and GraphQL's
+`remember(..., links: [{topic, relation}])` and `link(source, target,
+relation)` mutations do the same. Links may point at topics that are not
+recorded yet; those show up with `recorded: false`, which marks a hole in
+the lore. Other entry points are `search`, `sessions`, `session(id)` and
+`turn(uuid)`. A turn can walk `before` / `after` within its session. Run
+`python3 memory_graphql.py --schema` for the full schema.
+
+GraphQL is for exploration. For "do we have anything about X?", `recall`
+is simpler and leaves the model less room to get the query wrong. The
+server caps nesting depth, list sizes and result size.
+
 ## Install
 
 ```bash
-pip3 install --user fastembed
+pip3 install --user fastembed graphql-core   # graphql-core is only needed for query_memory
 
 mkdir -p "$PROJECT_ROOT/.claude/hooks/semantic-memory"
-cp indexer.py retrieval_hook.py "$PROJECT_ROOT/.claude/hooks/semantic-memory/"
+cp indexer.py retrieval_hook.py verify_hook.py memory_server.py memory_graphql.py \
+   "$PROJECT_ROOT/.claude/hooks/semantic-memory/"
 chmod +x "$PROJECT_ROOT/.claude/hooks/semantic-memory/"*.py
 
 # Backfill from existing session history for this project
 python3 "$PROJECT_ROOT/.claude/hooks/semantic-memory/indexer.py"
+
+# Give the model its recall / remember / query_memory tools
+cd "$PROJECT_ROOT" && claude mcp add semantic-memory --scope project -- \
+  python3 "$PROJECT_ROOT/.claude/hooks/semantic-memory/memory_server.py"
 ```
 
-Then register the hook in `$PROJECT_ROOT/.claude/settings.local.json`
+Then register both hooks in `$PROJECT_ROOT/.claude/settings.local.json`
 (merge into any existing config, don't overwrite it):
 
 ```json
@@ -103,11 +174,20 @@ Then register the hook in `$PROJECT_ROOT/.claude/settings.local.json`
   "hooks": {
     "UserPromptSubmit": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/semantic-memory/retrieval_hook.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/semantic-memory/verify_hook.py\""
           }
         ]
       }
@@ -116,15 +196,23 @@ Then register the hook in `$PROJECT_ROOT/.claude/settings.local.json`
 }
 ```
 
-Verify it standalone before trusting it live:
+To let the tools run without a permission prompt each time, add
+`"permissions": {"allow": ["mcp__semantic-memory__recall",
+"mcp__semantic-memory__query_memory"]}`. Leave `remember` and `forget`
+behind a prompt if you want to approve every canon change.
+
+Verify the pieces standalone before trusting them live:
 
 ```bash
-echo '{"user_prompt": "test query about something from this project history", "transcript_path": "<a real transcript path from ~/.claude/projects/<encoded-project-path>/>"}' \
-  | python3 "$PROJECT_ROOT/.claude/hooks/semantic-memory/retrieval_hook.py"
+H="$PROJECT_ROOT/.claude/hooks/semantic-memory"
+T="<a real transcript path from ~/.claude/projects/<encoded-project-path>/>"
+echo "{\"prompt\": \"something from this project history\", \"transcript_path\": \"$T\"}" | python3 "$H/retrieval_hook.py"
+echo "{\"last_assistant_message\": \"As we decided earlier, ...\", \"transcript_path\": \"$T\"}" | python3 "$H/verify_hook.py"
+python3 "$H/memory_graphql.py" '{ sessions(limit: 3) { id turnCount } }'
 ```
 
-Should exit 0. When the index has a match outside the live transcript, stdout is
-`{"hookSpecificOutput": {...}}`. No match prints nothing.
+Each hook exits 0 and prints `{"hookSpecificOutput": {...}}` when it has something to
+add, or nothing otherwise.
 
 ## How it works
 
@@ -132,7 +220,9 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
   uuid, chunk index, session id, role, timestamp, text, float32 vector and
   indexed_at. `messages_fts` is the trigger-synced keyword index, and
   `injections` records what was shown per session and compaction epoch.
-  Project-local, not shared across projects. An older database is migrated
+  `canon` and `canon_links` hold remembered facts and the links between
+  them, and `recalls` notes what the model looked up recently, so the
+  Stop hook doesn't repeat it. Project-local, not shared across projects. An older database is migrated
   and backfilled on open.
 - **Transcript source**: Claude Code's own session transcripts at
   `~/.claude/projects/<encoded-project-path>/*.jsonl`. The extractor reads
@@ -159,13 +249,18 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
   prompt. If you change the model, re-measure these values
   (`SCORE_THRESHOLD`, `RELATIVE_MARGIN`, `KEYWORD_FLOOR` in
   `retrieval_hook.py`).
-- **Latency**: about 0.65 s per prompt on a small index, almost all of it
-  loading the ONNX model in a fresh process.
+- **Latency**: each hook takes about 0.65 s on a small index, almost all of
+  it loading the ONNX model in a fresh process. The Stop hook only loads it
+  when the reply contains a past reference or a hedge. The MCP server loads
+  the model once; after that, recall and GraphQL calls took 0.01–0.09 s.
 - **Nudge threshold**: 2MB transcript file size (`LARGE_TRANSCRIPT_BYTES`
   in `indexer.py`). The same threshold is the fallback for "no compact
   boundary, but this file is too big to treat as fully live."
 - **Contract**: Claude Code's `UserPromptSubmit` hook — stdin JSON has
-  `user_prompt`, `transcript_path`, `session_id`, `cwd`, etc.; stdout must
+  `prompt`, `transcript_path`, `session_id`, `cwd`, etc. (earlier versions of
+  this repo read `user_prompt`, which Claude Code never sends, so live
+  retrieval silently did nothing). The `Stop` hook reads
+  `last_assistant_message` and `stop_hook_active`. stdout must
   be `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
   "additionalContext": "..."}}` on exit 0 to inject context. The hook exits
   0 with no output on any error and appends the traceback to
@@ -192,6 +287,11 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
   `additionalContext` in the conversation until compaction. If you start a
   new session with `/clear`, its session id changes, so recall starts fresh.
   To reset by hand, `DELETE FROM injections`.
+- Everything this project writes into the conversation (hook context,
+  tool results) starts with `[Project semantic memory`, and the indexer
+  skips it. Memory never indexes its own output.
+- The Stop hook's cue lists are English regexes in `verify_hook.py`. If
+  your sessions have phrasings it misses, add them there.
 - Injected excerpts are framed as reference. They are past transcript text,
   not new instructions, and the hook says so in the context header.
 - If `python3` on `PATH` doesn't have `fastembed` installed (e.g. system
@@ -205,7 +305,8 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
 python3 -m unittest test_semantic_memory.py
 ```
 
-The tests stub the embedder, so they do not download the model.
+The tests stub the embedder, so they do not download the model. The
+GraphQL tests are skipped when `graphql-core` is not installed.
 
 ## License
 

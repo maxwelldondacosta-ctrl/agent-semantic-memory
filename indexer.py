@@ -134,6 +134,23 @@ def ensure_db(path=None):
         )
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS canon (
+            topic_key    TEXT PRIMARY KEY,
+            topic        TEXT,
+            fact         TEXT NOT NULL,
+            recorded_at  TEXT
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS canon_links (
+            src       TEXT NOT NULL,
+            dst       TEXT NOT NULL,
+            relation  TEXT NOT NULL DEFAULT 'related',
+            dst_topic TEXT,
+            PRIMARY KEY(src, dst, relation)
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS recalls (
             msg_uuid     TEXT PRIMARY KEY,
             recalled_at  REAL
@@ -171,29 +188,52 @@ def _slug(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:80]
 
 
-def remember_fact(db, fact, topic=None):
+def canon_key(topic):
+    return _slug(topic)
+
+
+def remember_fact(db, fact, topic=None, links=None, embed=None):
     """Store an authoritative fact. A fact with the same topic replaces the old one.
 
-    Returns (uuid, replaced_text or None).
+    `links` is a list of (topic, relation) pairs pointing at other canon
+    topics, which need not exist yet. Re-remembering a topic keeps links
+    that are not restated. Returns (uuid, replaced_fact or None).
     """
     fact = (fact or "").strip()
     if not fact:
         raise ValueError("fact is empty")
-    key = _slug(topic) or hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()[:16]
+    key = canon_key(topic) or hashlib.sha1(fact.lower().encode("utf-8")).hexdigest()[:16]
     msg_uuid = "canon:" + key
-    previous = db.execute(
-        "SELECT text FROM messages WHERE msg_uuid=? ORDER BY chunk_index", (msg_uuid,)
-    ).fetchall()
-    replaced = "\n".join(row[0] for row in previous) if previous else None
-    db.execute("DELETE FROM messages WHERE msg_uuid=?", (msg_uuid,))
+    previous = db.execute("SELECT fact FROM canon WHERE topic_key=?", (key,)).fetchone()
+    replaced = previous[0] if previous else None
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    text = f"{topic.strip()}: {fact}" if topic and topic.strip() else fact
-    index_messages(db, list(iter_chunks([(msg_uuid, CANON_SESSION, "canon", stamp, text)])))
+    label = (topic or "").strip() or None
+    db.execute(
+        "INSERT OR REPLACE INTO canon (topic_key, topic, fact, recorded_at) VALUES (?, ?, ?, ?)",
+        (key, label, fact, stamp),
+    )
+    for target, relation in links or ():
+        target_key = canon_key(target)
+        if target_key and target_key != key:
+            link_canon(db, key, target_key, relation, target.strip())
+    db.execute("DELETE FROM messages WHERE msg_uuid=?", (msg_uuid,))
+    text = f"{label}: {fact}" if label else fact
+    index_messages(db, list(iter_chunks([(msg_uuid, CANON_SESSION, "canon", stamp, text)])), embed)
     return msg_uuid, replaced
 
 
+def link_canon(db, src_key, dst_key, relation=None, dst_topic=None):
+    db.execute(
+        "INSERT OR IGNORE INTO canon_links (src, dst, relation, dst_topic) VALUES (?, ?, ?, ?)",
+        (src_key, dst_key, (relation or "related").strip() or "related", dst_topic),
+    )
+
+
 def forget_fact(db, topic):
-    cur = db.execute("DELETE FROM messages WHERE msg_uuid=?", ("canon:" + _slug(topic),))
+    key = canon_key(topic)
+    cur = db.execute("DELETE FROM canon WHERE topic_key=?", (key,))
+    db.execute("DELETE FROM canon_links WHERE src=? OR dst=?", (key, key))
+    db.execute("DELETE FROM messages WHERE msg_uuid=?", ("canon:" + key,))
     db.commit()
     return cur.rowcount > 0
 
@@ -468,12 +508,12 @@ def _batches(rows, size):
         yield batch
 
 
-def index_messages(db, messages):
+def index_messages(db, messages, embed=None):
     """Embed and upsert chunk rows. `messages` items are chunk tuples."""
     if not messages:
         return 0
     texts = [row[5] for row in messages]
-    vectors = fastembed_embed(texts)
+    vectors = (embed or fastembed_embed)(texts)
     now = time.time()
     cur = db.cursor()
     by_uuid = {}
@@ -710,6 +750,8 @@ def _neighbor_rows(db, session_id, hit_id, hit_uuid, window):
     ).fetchall()
 
     def take(rows, count):
+        if count <= 0:
+            return []
         picked = []
         seen = set()
         for row in rows:
@@ -749,6 +791,22 @@ def retrieve_with_ids(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45
     below 0.4, so an absolute cutoff alone lets the background through.
     """
     exclude = set(exclude_uuids or ())
+    chosen = search_hits(
+        db, query_vec, exclude, top_k=top_k, threshold=threshold, pool_size=pool_size,
+        query_text=query_text, keyword_floor=keyword_floor, relative_margin=relative_margin,
+    )
+    if not chosen:
+        return None, []
+    return _render_hits(db, chosen, exclude, context_window, max_chars, snippet_chars, header)
+
+
+def search_hits(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45, pool_size=24,
+                query_text=None, keyword_floor=0.55, relative_margin=None,
+                sessions=None, skip_sessions=None):
+    """Ranked, diversified hit dicts (see retrieve_with_ids for the gates)."""
+    exclude = set(exclude_uuids or ())
+    only = set(sessions) if sessions else None
+    skip = set(skip_sessions or ())
     rows = db.execute(
         """SELECT id, msg_uuid, session_id, role, timestamp, text, vector
            FROM messages WHERE vector IS NOT NULL"""
@@ -756,7 +814,9 @@ def retrieve_with_ids(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45
     usable = []
     vectors = []
     for row in rows:
-        if row[1] in exclude:
+        if row[1] in exclude or row[2] in skip:
+            continue
+        if only is not None and row[2] not in only:
             continue
         vec = unpack_vector(row[6])
         if not vec:
@@ -764,7 +824,7 @@ def retrieve_with_ids(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45
         usable.append(row)
         vectors.append(vec)
     if not usable:
-        return None, []
+        return []
 
     scores = _score_all(query_vec, vectors)
     by_id = {}
@@ -807,10 +867,12 @@ def retrieve_with_ids(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45
         item["fused"] = fused
         candidates.append(item)
     if not candidates:
-        return None, []
+        return []
     candidates.sort(key=lambda item: item["fused"], reverse=True)
-    chosen = _diverse(candidates[:pool_size], top_k)
+    return _diverse(candidates[:pool_size], top_k)
 
+
+def _render_hits(db, chosen, exclude, context_window, max_chars, snippet_chars, header):
     seen = set()
     blocks = []
     for hit in chosen:

@@ -50,6 +50,13 @@ _HEDGE = re.compile(
     r"i assume|assuming|i'd guess|my guess|should be|presumably)\b",
     re.IGNORECASE,
 )
+# A sentence that proposes ("should", "let's", "maybe") is an opinion, not a
+# recalled fact, so having no record of it says nothing.
+_PROPOSAL = re.compile(
+    r"\b(?:should|could|would|let's|let us|maybe|perhaps|how about|consider|suggest|"
+    r"propose|recommend|might want|i'd)\b",
+    re.IGNORECASE,
+)
 _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -79,14 +86,28 @@ def memory_claims(reply, limit=MAX_CLAIMS):
     return claims
 
 
+def _has_any_record(db, vec, claim):
+    """Whether memory holds anything at all on this claim, live context included."""
+    import indexer
+    return bool(indexer.search_hits(
+        db, vec, top_k=1, threshold=SCORE_THRESHOLD, relative_margin=RELATIVE_MARGIN,
+        query_text=claim,
+    ))
+
+
 def build_check(db, claims, exclude, embed):
     import indexer
     vectors = embed([indexer.QUERY_PREFIX + claim for claim in claims])
     blocks = []
     shown = []
+    unsupported = []
     seen = set(exclude)
     budget = MAX_CHECK_CHARS
     for claim, vec in zip(claims, vectors):
+        if not _has_any_record(db, vec, claim):
+            if not _PROPOSAL.search(claim):
+                unsupported.append(claim)
+            continue
         text, ids = indexer.retrieve_with_ids(
             db,
             vec,
@@ -106,17 +127,27 @@ def build_check(db, claims, exclude, embed):
         budget -= len(text)
         if budget <= 200:
             break
-    if not blocks:
+    if not blocks and not unsupported:
         return None, []
-    message = (
-        f"{indexer.MEMORY_MARK} · check] Your last reply relied on remembered context, "
-        "and project memory holds records you have not seen in this context window. "
-        "Compare them with what you told the user. If anything you said conflicts "
-        "with a record (CANON wins, then the most recent turn), tell the user plainly "
-        "what you got wrong and give the corrected answer. If it all matches, reply "
-        "with one short line saying it was checked against memory.\n\n"
-        + "\n\n".join(blocks)
-    )
+    parts = [f"{indexer.MEMORY_MARK} · check] Your last reply relied on remembered context."]
+    if blocks:
+        parts.append(
+            "Project memory holds records you have not seen in this context window. "
+            "Compare them with what you told the user. If anything you said conflicts "
+            "with a record (CANON wins, then the most recent turn), tell the user plainly "
+            "what you got wrong and give the corrected answer."
+        )
+    if unsupported:
+        parts.append(
+            "Project memory has no record at all for: "
+            + "; ".join(f'"{claim}"' for claim in unsupported[:2])
+            + ". If that came from a file you read or from the user in this turn, ignore "
+            "this. Otherwise tell the user it is your suggestion, not something established."
+        )
+    parts.append("If everything holds up, reply with one short line saying it was checked against memory.")
+    message = " ".join(parts)
+    if blocks:
+        message += "\n\n" + "\n\n".join(blocks)
     return message, shown
 
 

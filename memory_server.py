@@ -78,9 +78,47 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "fact": {"type": "string", "description": "The fact, stated fully on its own."},
-                "topic": {"type": "string", "description": "Stable key, e.g. 'boss: Vargan stats'."},
+                "topic": {"type": "string", "description": "Stable key, e.g. 'Vargan' or 'Frost Caverns'."},
+                "related": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Other canon topics this fact connects to, optionally as "
+                        "'relation: topic' (e.g. 'lives in: Frost Caverns', 'wields: Ice Brand')."
+                    ),
+                },
             },
             "required": ["fact"],
+        },
+    },
+    {
+        "name": "query_memory",
+        "description": (
+            "Run a GraphQL query against project memory when you need structure rather "
+            "than a quick lookup: everything linked to a canon topic, the conversation "
+            "where a fact was decided, the turns around a match, or a session's recent "
+            "turns. For a simple 'do we have anything about X', use recall instead. An "
+            "empty search list means no record. Schema:\n"
+            "Query { search(query, limit, canonOnly, includeCanon, session): [Hit]; "
+            "canon(topic, contains, limit): [CanonFact]; sessions(limit): [Session]; "
+            "session(id): Session; turn(uuid): Turn }\n"
+            "Mutation { remember(fact, topic, links:[{topic, relation}]): {fact, replaced}; "
+            "link(source, target, relation): Boolean; forget(topic): Boolean }\n"
+            "Hit { score keywords excerpt(maxChars) canon: CanonFact turn: Turn }\n"
+            "Turn { uuid role timestamp text(maxChars) session before(count) after(count) }\n"
+            "Session { id startedAt endedAt turnCount turns(limit, offset, fromEnd) }\n"
+            "CanonFact { key topic fact recordedAt recorded "
+            "links { relation direction target: CanonFact } discussedIn(limit): [Hit] }\n"
+            "Example: { canon(topic: \"Vargan\") { fact links { relation target { topic fact } } "
+            "discussedIn(limit: 2) { excerpt turn { timestamp before(count: 1) { text } } } } }"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "GraphQL document."},
+                "variables": {"type": "object"},
+            },
+            "required": ["query"],
         },
     },
     {
@@ -142,16 +180,37 @@ class MemoryServer:
             ), False
         return text, False
 
-    def remember(self, fact, topic=None):
+    def remember(self, fact, topic=None, related=None):
+        links = []
+        for entry in related or ():
+            relation, sep, target = str(entry).partition(":")
+            links.append((target, relation) if sep and target.strip() else (entry, "related"))
         db = self._db()
         try:
-            msg_uuid, replaced = indexer.remember_fact(db, fact, topic)
+            msg_uuid, replaced = indexer.remember_fact(db, fact, topic, links)
         finally:
             db.close()
         note = f"{indexer.MEMORY_MARK} · remember] Recorded as canon ({msg_uuid})."
+        if links:
+            note += "\nLinked to: " + ", ".join(f"{rel.strip()} → {tgt.strip()}" for tgt, rel in links)
         if replaced:
             note += f"\nReplaced previous entry: {replaced}"
         return note, False
+
+    def query_memory(self, query, variables=None):
+        if not (query or "").strip():
+            return "query_memory needs a GraphQL document.", True
+        try:
+            import memory_graphql
+        except ImportError:
+            return "GraphQL is unavailable: pip3 install --user graphql-core", True
+        db = self._db()
+        try:
+            payload = memory_graphql.execute(db, query, variables)
+        finally:
+            db.close()
+        text = f"{indexer.MEMORY_MARK} · graphql]\n" + memory_graphql.render(payload)
+        return text, bool(payload.get("errors")) and payload.get("data") is None
 
     def forget(self, topic):
         db = self._db()
@@ -168,7 +227,9 @@ class MemoryServer:
         if name == "recall":
             return self.recall(arguments.get("query"), arguments.get("limit"))
         if name == "remember":
-            return self.remember(arguments.get("fact"), arguments.get("topic"))
+            return self.remember(arguments.get("fact"), arguments.get("topic"), arguments.get("related"))
+        if name == "query_memory":
+            return self.query_memory(arguments.get("query"), arguments.get("variables"))
         if name == "forget":
             return self.forget(arguments.get("topic"))
         return f"Unknown tool: {name}", True

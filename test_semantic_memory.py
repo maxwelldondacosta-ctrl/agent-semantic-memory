@@ -598,7 +598,7 @@ class MemoryServerTests(unittest.TestCase):
         names = [tool["name"] for tool in self.server.handle(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
         )["result"]["tools"]]
-        self.assertEqual(names, ["recall", "remember", "forget"])
+        self.assertEqual(names, ["recall", "remember", "query_memory", "forget"])
         missing = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})
         self.assertEqual(missing["error"]["code"], -32601)
 
@@ -636,6 +636,10 @@ class MemoryServerTests(unittest.TestCase):
         self.assertIn("CANON", recalled)
         self.assertIn("450 HP", recalled)
         self.assertNotIn("Vargan has 300 HP", recalled)
+        self._call("remember", fact="The Frost Caverns lie north of town", topic="Frost Caverns")
+        alone, _ = self._call("recall", query="Vargan hit points")
+        self.assertNotIn("Frost Caverns", alone)
+        self._call("forget", topic="Frost Caverns")
         removed, _ = self._call("forget", topic="Vargan stats")
         self.assertIn("Removed", removed)
         gone, _ = self._call("recall", query="Vargan hit points")
@@ -651,6 +655,130 @@ class MemoryServerTests(unittest.TestCase):
         self.assertEqual(list(indexer.extract_messages(path)), [])
 
 
+try:
+    import graphql  # noqa: F401
+    import memory_graphql
+except ImportError:
+    memory_graphql = None
+
+
+@unittest.skipIf(memory_graphql is None, "graphql-core not installed")
+class GraphQLTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        indexer.INDEX_DB = os.path.join(self.tmp.name, "semantic_memory.db")
+        self.db = indexer.ensure_db()
+        path = os.path.join(self.tmp.name, "s1.jsonl")
+        _write_jsonl(path, [
+            _user("a", "time to design the first boss", session="s1"),
+            _user("b", "Vargan should have 450 HP and be weak to ice", session="s1"),
+            _assistant("c", "Set Vargan to 450 HP", session="s1"),
+            _user("d", "now the billing screen", session="s1"),
+        ])
+        with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            indexer.refresh_transcript(self.db, path)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def run_query(self, source, variables=None):
+        return memory_graphql.execute(self.db, source, variables, embed=topic_embed)
+
+    def test_remember_with_links_builds_a_two_way_lore_graph(self):
+        result = self.run_query("""
+            mutation($links: [LinkInput!]) {
+              remember(fact: "Vargan has 450 HP, weak to ice", topic: "Vargan", links: $links) {
+                replaced fact { key }
+              }
+            }""", {"links": [
+                {"topic": "Frost Caverns", "relation": "lives in"},
+                {"topic": "Ice Brand", "relation": "weak to"},
+            ]})
+        self.assertEqual(result["data"]["remember"]["fact"]["key"], "vargan")
+        self.run_query('mutation { remember(fact: "Glacial cave north of town", topic: "Frost Caverns") { replaced } }')
+
+        vargan = self.run_query("""{ canon(topic: "vargan") {
+            links { relation direction target { topic recorded fact } } } }""")["data"]["canon"][0]
+        links = {link["target"]["topic"]: link for link in vargan["links"]}
+        self.assertEqual(links["Frost Caverns"]["relation"], "lives in")
+        self.assertEqual(links["Frost Caverns"]["target"]["fact"], "Glacial cave north of town")
+        self.assertFalse(links["Ice Brand"]["target"]["recorded"])
+        self.assertIsNone(links["Ice Brand"]["target"]["fact"])
+
+        caverns = self.run_query('{ canon(topic: "Frost Caverns") { links { direction target { topic } } } }')
+        self.assertEqual(caverns["data"]["canon"][0]["links"], [{"direction": "in", "target": {"topic": "Vargan"}}])
+
+    def test_canon_fact_leads_back_to_the_conversation_that_decided_it(self):
+        self.run_query('mutation { remember(fact: "Vargan has 450 HP", topic: "Vargan") { replaced } }')
+        found = self.run_query("""{ canon(topic: "Vargan") { discussedIn(limit: 1) {
+            canon { key } turn { role text before(count: 1) { text } after(count: 1) { text } session { id turnCount } } } } }""")
+        hit = found["data"]["canon"][0]["discussedIn"][0]
+        self.assertIsNone(hit["canon"])
+        self.assertIn("Vargan", hit["turn"]["text"])
+        self.assertEqual(hit["turn"]["session"], {"id": "s1", "turnCount": 4})
+        self.assertTrue(hit["turn"]["before"] or hit["turn"]["after"])
+
+    def test_search_filters_and_empty_result(self):
+        self.run_query('mutation { remember(fact: "Vargan has 450 HP", topic: "Vargan") { replaced } }')
+        canon_only = self.run_query('{ search(query: "Vargan HP", canonOnly: true) { canon { topic } turn { uuid } } }')
+        self.assertEqual(canon_only["data"]["search"], [{"canon": {"topic": "Vargan"}, "turn": None}])
+        turns_only = self.run_query('{ search(query: "Vargan HP", includeCanon: false) { canon { topic } } }')
+        self.assertTrue(turns_only["data"]["search"])
+        self.assertTrue(all(hit["canon"] is None for hit in turns_only["data"]["search"]))
+        nothing = self.run_query('{ search(query: "sword", limit: 3) { score } }')
+        self.assertEqual(nothing["data"]["search"], [])
+
+    def test_sessions_and_long_turn_reassembly(self):
+        long_text = "start " + ("lore " * 700) + "the end"
+        path = os.path.join(self.tmp.name, "s2.jsonl")
+        _write_jsonl(path, [_user("long", long_text, session="s2")])
+        with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            indexer.refresh_transcript(self.db, path)
+        turn = self.run_query('{ turn(uuid: "long") { text(maxChars: 4000) } }')["data"]["turn"]
+        self.assertEqual(turn["text"], long_text)
+        sessions = self.run_query('{ sessions(limit: 5) { id turns(limit: 1, fromEnd: true) { uuid } } }')
+        ids = [session["id"] for session in sessions["data"]["sessions"]]
+        self.assertEqual(ids[0], "s2")
+        self.assertNotIn(indexer.CANON_SESSION, ids)
+
+    def test_forget_removes_fact_and_links(self):
+        self.run_query("""mutation { remember(fact: "Vargan has 450 HP", topic: "Vargan",
+            links: [{topic: "Frost Caverns"}]) { replaced } }""")
+        self.assertTrue(self.run_query('mutation { forget(topic: "Vargan") }')["data"]["forget"])
+        self.assertEqual(self.run_query('{ canon(topic: "Vargan") { fact } }')["data"]["canon"], [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM canon_links").fetchone()[0], 0)
+
+    def test_errors_depth_limit_and_size_cap(self):
+        bad = self.run_query("{ nope }")
+        self.assertIsNone(bad["data"])
+        self.assertIn("nope", bad["errors"][0]["message"])
+        deep = "{ sessions { turns { before { after { before { after { before { after { uuid } } } } } } } } }"
+        self.assertIn("deeper", self.run_query(deep)["errors"][0]["message"])
+        rendered = memory_graphql.render({"data": {"x": "y" * (memory_graphql.MAX_RESULT_CHARS + 10)}})
+        self.assertIn("over the", json.loads(rendered)["errors"][0]["message"])
+
+    def test_graphql_lookups_count_as_recalled_for_the_stop_hook(self):
+        self.run_query('mutation { remember(fact: "Vargan has 450 HP", topic: "Vargan") { replaced } }')
+        self.db.execute("DELETE FROM recalls")
+        self.db.commit()
+        self.run_query('{ canon(topic: "Vargan") { fact } }')
+        self.assertIn("canon:vargan", indexer.recently_recalled(self.db))
+
+    def test_mcp_tool_wraps_graphql_and_remember_parses_relations(self):
+        with mock.patch.object(indexer, "TRANSCRIPTS_DIR", self.tmp.name), \
+                mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            server = memory_server.MemoryServer()
+            note, _ = server.remember("Vargan wields the Ice Brand", "Vargan", ["wields: Ice Brand", "Frost Caverns"])
+            self.assertIn("wields → Ice Brand", note)
+            text, is_error = server.query_memory('{ canon(topic: "Vargan") { links { relation target { topic } } } }')
+        self.assertFalse(is_error)
+        self.assertTrue(text.startswith(indexer.MEMORY_MARK))
+        payload = json.loads(text.split("\n", 1)[1])
+        relations = {link["relation"]: link["target"]["topic"] for link in payload["data"]["canon"][0]["links"]}
+        self.assertEqual(relations, {"wields": "Ice Brand", "related": "Frost Caverns"})
+
+
 class VerifyHookTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -660,7 +788,7 @@ class VerifyHookTests(unittest.TestCase):
             indexer.remember_fact(db, "Vargan has 450 HP and is weak to ice", "Vargan stats")
         db.close()
         self.transcript = os.path.join(self.tmp.name, "cur.jsonl")
-        _write_jsonl(self.transcript, [_user("c1", "make the boss fight harder", session="cur")])
+        _write_jsonl(self.transcript, [_user("c1", "make the Vargan fight harder", session="cur")])
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -700,6 +828,14 @@ class VerifyHookTests(unittest.TestCase):
             "I don't remember how much HP Vargan has, so I left it unchanged."
         ))
         self.assertIn("450 HP", body)
+
+    def test_asserting_a_detail_memory_has_never_seen_is_flagged(self):
+        body = _run_main(verify_hook, self._payload(
+            "I think the dragon in act three is called Seraphine."
+        ))
+        self.assertIn("no record at all", body)
+        self.assertIn("Seraphine", body)
+        self.assertIn("your suggestion, not something established", body)
 
     def test_silent_when_already_continuing_or_nothing_to_check(self):
         self.assertIsNone(_run_main(verify_hook, self._payload(
