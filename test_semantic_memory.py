@@ -940,7 +940,7 @@ class VerifyHookTests(unittest.TestCase):
         )))
 
     def test_same_records_are_not_pushed_twice_in_one_epoch(self):
-        reply = "As we decided, Vargan has 300 HP."
+        reply = "As we decided, Vargan has 450 HP."
         self.assertIsNotNone(_run_main(verify_hook, self._payload(reply)))
         self.assertIsNone(_run_main(verify_hook, self._payload(reply)))
 
@@ -948,7 +948,55 @@ class VerifyHookTests(unittest.TestCase):
         db = indexer.ensure_db()
         indexer.record_recalls(db, ["canon:vargan-stats"])
         db.close()
-        self.assertIsNone(_run_main(verify_hook, self._payload("As we decided, Vargan has 300 HP.")))
+        self.assertIsNone(_run_main(verify_hook, self._payload("As we decided, Vargan has 450 HP.")))
+
+    def test_flat_confident_contradiction_is_caught_without_cue_words(self):
+        body = _run_main(verify_hook, self._payload("Vargan has 300 HP. The arena is lit by torches."))
+        self.assertIn("contradicts recorded canon", body)
+        self.assertIn("you said 300, canon says 450", body)
+        self.assertIn("update canon with `remember`", body)
+
+    def test_contradiction_is_reported_even_when_canon_was_already_seen(self):
+        db = indexer.ensure_db()
+        indexer.record_recalls(db, ["canon:vargan-stats"])
+        db.close()
+        body = _run_main(verify_hook, self._payload("Vargan is weak to fire, so use flame arrows."))
+        self.assertIn("weak to: you said fire, canon says ice", body)
+
+    def test_described_changes_and_proposals_are_not_conflicts(self):
+        db = indexer.ensure_db()
+        indexer.record_recalls(db, ["canon:vargan-stats"])
+        db.close()
+        self.assertIsNone(_run_main(verify_hook, self._payload(
+            "I raised Vargan from 450 HP to 600 HP for the hard mode."
+        )))
+        self.assertIsNone(_run_main(verify_hook, self._payload(
+            "Vargan should have 600 HP on hard mode."
+        )))
+
+    def test_topic_aliases_avoid_common_words(self):
+        db = indexer.ensure_db()
+        with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            indexer.remember_fact(db, "A level 12 area north of town", "Frost Caverns")
+        entities = verify_hook.canon_entities(db)
+        db.close()
+        claims = verify_hook.find_claims(
+            "Frost spells are cheap now. The frost caverns are a level 15 zone. Vargan roars.", entities
+        )
+        self.assertEqual(
+            [(c["text"], [e[1] for e in c["entities"]]) for c in claims],
+            [("The frost caverns are a level 15 zone.", ["Frost Caverns"]),
+             ("Vargan roars.", ["Vargan stats"])],
+        )
+        conflict = verify_hook.find_conflicts(claims)[0]
+        self.assertEqual((conflict["unit"], conflict["said"], conflict["canon"]), ("level", ["15"], ["12"]))
+
+    def test_value_extraction(self):
+        values = verify_hook.extract_values("Vargan has 450 HP, deals 30 damage, is level 12 and weak to ice.")
+        self.assertEqual(values["hp"], {450.0})
+        self.assertEqual(values["damage"], {30.0})
+        self.assertEqual(values["level"], {12.0})
+        self.assertEqual(values["weak to"], {"ice"})
 
 
 if __name__ == "__main__":

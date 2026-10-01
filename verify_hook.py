@@ -70,20 +70,146 @@ def log_failure(exc):
         pass
 
 
-def memory_claims(reply, limit=MAX_CLAIMS):
-    """Sentences of `reply` that depend on remembered context."""
+def canon_entities(db):
+    """[(key, topic, fact, [(alias, case_sensitive)])] for labelled canon topics.
+
+    The full topic matches case-insensitively. When a topic is one proper
+    noun plus lowercase descriptors ("Vargan stats", "Elara backstory"),
+    that noun alone also matches, with its capital. A multi-word name such
+    as "Frost Caverns" must match in full, so "Frost spells" does not.
+    """
+    entities = []
+    for key, topic, fact in db.execute("SELECT topic_key, topic, fact FROM canon WHERE topic IS NOT NULL"):
+        aliases = [(topic, False)]
+        words = re.findall(r"[A-Za-z][\w'-]+", topic)
+        proper = [word for word in words if word[0].isupper()]
+        if len(words) > 1 and len(proper) == 1 and len(proper[0]) >= 3:
+            aliases.append((proper[0], True))
+        entities.append((key, topic, fact, aliases))
+    return entities
+
+
+def _mentions(sentence, aliases):
+    for alias, case_sensitive in aliases:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        if re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", sentence, flags):
+            return True
+    return False
+
+
+def find_claims(reply, entities=(), limit=MAX_CLAIMS):
+    """Sentences worth checking: past references, hedges, and canon mentions.
+
+    Each claim is {"text", "cue", "entities"}. `cue` is True for sentences
+    flagged by wording; canon mentions need no particular wording, which is
+    what catches a flat, confident "Vargan has 300 HP."
+    """
     text = _CODE_FENCE.sub(" ", reply or "")
     claims = []
     for sentence in _SENTENCE.split(text):
         sentence = " ".join(sentence.split()).strip(" -*>#")
-        if len(sentence) < 15:
+        if len(sentence) < 12:
             continue
-        if not (_PAST_REFERENCE.search(sentence) or _HEDGE.search(sentence)):
+        cue = bool(_PAST_REFERENCE.search(sentence) or _HEDGE.search(sentence))
+        mentioned = [entity for entity in entities if _mentions(sentence, entity[3])]
+        if not cue and not mentioned:
             continue
-        claims.append(sentence[:CLAIM_CHARS])
+        claims.append({"text": sentence[:CLAIM_CHARS], "cue": cue, "entities": mentioned})
         if len(claims) >= limit:
             break
     return claims
+
+
+def memory_claims(reply, limit=MAX_CLAIMS):
+    """Wording-flagged sentences only (no canon lookup)."""
+    return [claim["text"] for claim in find_claims(reply, (), limit)]
+
+
+_NUM_UNIT = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(%|[A-Za-z][A-Za-z-]*)")
+_UNIT_NUM = re.compile(
+    r"\b(level|lvl|tier|act|chapter|wave|stage|rank|floor|phase|zone|world|room)\s+(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+_ATTRIBUTE = re.compile(
+    r"\b(weak(?:ness)?|vulnerab(?:le|ility)|immun(?:e|ity)|resist(?:ant|ance)?)"
+    r"\s+(?:is\s+|are\s+)?(?:to\s+|against\s+)?([a-z]+)",
+    re.IGNORECASE,
+)
+_NOT_UNITS = frozenset("""
+a an and or the to of in on at for by with from as is are was were be it its this that
+than then times x per but so if into over under after before about vs
+""".split())
+
+
+def _normalize_unit(unit):
+    unit = unit.lower()
+    if unit in ("lvl",):
+        return "level"
+    if len(unit) > 3 and unit.endswith("s") and not unit.endswith("ss"):
+        unit = unit[:-1]
+    return unit
+
+
+def _attribute_kind(word):
+    word = word.lower()
+    if word.startswith(("weak", "vulnerab")):
+        return "weak to"
+    if word.startswith("immun"):
+        return "immune to"
+    return "resistant to"
+
+
+def extract_values(text):
+    """{unit or attribute: {values}} for concrete, checkable details."""
+    values = {}
+    for number, unit in _NUM_UNIT.findall(text or ""):
+        unit = _normalize_unit(unit)
+        if unit in _NOT_UNITS or unit in ("level", "tier", "act", "chapter", "wave", "stage", "rank"):
+            continue
+        values.setdefault(unit, set()).add(float(number))
+    for unit, number in _UNIT_NUM.findall(text or ""):
+        values.setdefault(_normalize_unit(unit), set()).add(float(number))
+    for kind, target in _ATTRIBUTE.findall(text or ""):
+        if target.lower() in _NOT_UNITS:
+            continue
+        values.setdefault(_attribute_kind(kind), set()).add(target.lower())
+    return values
+
+
+def _show(value):
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    return value
+
+
+def find_conflicts(claims):
+    """Concrete contradictions between a sentence and canon about a named topic.
+
+    A sentence that also states the canon value is describing a change
+    ("raised from 450 to 600 HP"), and a proposal is not a claim; neither
+    counts. Conflicts are reported even when the canon entry is already in
+    the live context: contradicting visible canon is still drift.
+    """
+    conflicts = []
+    for claim in claims:
+        if not claim["entities"] or _PROPOSAL.search(claim["text"]):
+            continue
+        said = extract_values(claim["text"])
+        if not said:
+            continue
+        for _key, topic, fact, _aliases in claim["entities"]:
+            canon = extract_values(fact)
+            for unit, values in said.items():
+                if unit in canon and not (values & canon[unit]):
+                    conflicts.append({
+                        "claim": claim["text"],
+                        "topic": topic,
+                        "fact": fact,
+                        "unit": unit,
+                        "said": sorted(_show(v) for v in values),
+                        "canon": sorted(_show(v) for v in canon[unit]),
+                    })
+    return conflicts
 
 
 def _has_any_record(db, vec, claim):
@@ -96,19 +222,25 @@ def _has_any_record(db, vec, claim):
 
 
 def build_check(db, claims, exclude, embed):
+    """(message or None, uuids shown). `claims` come from find_claims."""
     import indexer
-    vectors = embed([indexer.QUERY_PREFIX + claim for claim in claims])
+    if not claims:
+        return None, []
+    conflicts = find_conflicts(claims)
+    texts = [claim["text"] for claim in claims]
+    vectors = embed([indexer.QUERY_PREFIX + text for text in texts])
     blocks = []
     shown = []
     unsupported = []
     seen = set(exclude)
     budget = MAX_CHECK_CHARS
     for claim, vec in zip(claims, vectors):
-        if not _has_any_record(db, vec, claim):
-            if not _PROPOSAL.search(claim):
-                unsupported.append(claim)
+        text = claim["text"]
+        if not claim["entities"] and not _has_any_record(db, vec, text):
+            if claim["cue"] and not _PROPOSAL.search(text):
+                unsupported.append(text)
             continue
-        text, ids = indexer.retrieve_with_ids(
+        excerpt, ids = indexer.retrieve_with_ids(
             db,
             vec,
             exclude_uuids=seen,
@@ -116,26 +248,41 @@ def build_check(db, claims, exclude, embed):
             threshold=SCORE_THRESHOLD,
             relative_margin=RELATIVE_MARGIN,
             max_chars=budget,
-            query_text=claim,
-            header=f'You wrote: "{claim}"',
+            query_text=text,
+            header=f'You wrote: "{text}"',
         )
         if not ids:
             continue
-        blocks.append(text)
+        blocks.append(excerpt)
         shown.extend(ids)
         seen.update(ids)
-        budget -= len(text)
+        budget -= len(excerpt)
         if budget <= 200:
             break
-    if not blocks and not unsupported:
+    if not blocks and not unsupported and not conflicts:
         return None, []
-    parts = [f"{indexer.MEMORY_MARK} · check] Your last reply relied on remembered context."]
+
+    parts = [f"{indexer.MEMORY_MARK} · check]"]
+    if conflicts:
+        lines = ["Your last reply contradicts recorded canon:"]
+        for item in conflicts[:4]:
+            lines.append(
+                f'- You wrote "{item["claim"]}", but canon "{item["topic"]}" says '
+                f'"{item["fact"]}" ({item["unit"]}: you said {", ".join(map(str, item["said"]))}, '
+                f'canon says {", ".join(map(str, item["canon"]))}).'
+            )
+        lines.append(
+            "Tell the user plainly which detail was wrong and give the canon value. If the "
+            "user asked for this change in this conversation, it is not a mistake: say so "
+            "and update canon with `remember` so memory matches."
+        )
+        parts.append("\n".join(lines))
     if blocks:
         parts.append(
-            "Project memory holds records you have not seen in this context window. "
-            "Compare them with what you told the user. If anything you said conflicts "
-            "with a record (CANON wins, then the most recent turn), tell the user plainly "
-            "what you got wrong and give the corrected answer."
+            "Your reply relied on remembered context, and project memory holds records you "
+            "have not seen in this context window. Compare them with what you told the "
+            "user. If anything conflicts (CANON wins, then the most recent turn), tell the "
+            "user plainly what you got wrong and give the corrected answer."
         )
     if unsupported:
         parts.append(
@@ -144,8 +291,9 @@ def build_check(db, claims, exclude, embed):
             + ". If that came from a file you read or from the user in this turn, ignore "
             "this. Otherwise tell the user it is your suggestion, not something established."
         )
-    parts.append("If everything holds up, reply with one short line saying it was checked against memory.")
-    message = " ".join(parts)
+    if not conflicts:
+        parts.append("If everything holds up, reply with one short line saying it was checked against memory.")
+    message = " ".join(parts[:1]) + " " + "\n\n".join(parts[1:])
     if blocks:
         message += "\n\n" + "\n\n".join(blocks)
     return message, shown
@@ -161,8 +309,8 @@ def main():
 
     if payload.get("stop_hook_active"):
         sys.exit(0)
-    claims = memory_claims(payload.get("last_assistant_message") or "")
-    if not claims:
+    reply = payload.get("last_assistant_message") or ""
+    if not reply.strip():
         sys.exit(0)
 
     transcript_path = payload.get("transcript_path")
@@ -170,6 +318,10 @@ def main():
         import indexer
 
         db = indexer.ensure_db()
+        claims = find_claims(reply, canon_entities(db))
+        if not claims:
+            db.close()
+            sys.exit(0)
         indexer.refresh_transcript(db, transcript_path)
         live, epoch = indexer.live_context(transcript_path) if transcript_path else (set(), 0)
         session_key = payload.get("session_id") or (
