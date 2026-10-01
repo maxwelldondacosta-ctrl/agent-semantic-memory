@@ -23,8 +23,11 @@ import json
 import math
 import os
 import re
+import socket
 import sqlite3
 import sys
+import tempfile
+import threading
 import time
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -51,13 +54,27 @@ MEMORY_MARK = "[Project semantic memory"
 CANON_SESSION = "canon"
 
 _embedder = None
+_embedder_lock = threading.Lock()
+# The MCP server sets this to False: it is the process that owns the model.
+USE_EMBED_SERVICE = os.environ.get("SEMANTIC_MEMORY_NO_DAEMON") != "1"
+
+
+def _embed_socket_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    key = hashlib.sha1(SCRIPT_DIR.encode("utf-8")).hexdigest()[:12]
+    uid = getattr(os, "getuid", lambda: 0)()
+    return os.path.join(base, f"semantic-memory-{uid}-{key}.sock")
+
+
+EMBED_SOCKET = _embed_socket_path()
 
 
 def get_embedder():
     global _embedder
-    if _embedder is None:
-        from fastembed import TextEmbedding
-        _embedder = TextEmbedding(model_name=EMBED_MODEL)
+    with _embedder_lock:
+        if _embedder is None:
+            from fastembed import TextEmbedding
+            _embedder = TextEmbedding(model_name=EMBED_MODEL)
     return _embedder
 
 
@@ -354,9 +371,46 @@ def _migrate(db):
     db.commit()
 
 
-def fastembed_embed(texts):
+def embed_locally(texts):
     embedder = get_embedder()
-    return [vec.tolist() for vec in embedder.embed(texts)]
+    return [vec.tolist() for vec in embedder.embed(list(texts))]
+
+
+def _embed_via_service(texts):
+    """Borrow the model the MCP server already has loaded, or return None.
+
+    Loading the ONNX model is ~0.6 s of every hook run; asking the running
+    server over a private Unix socket takes milliseconds.
+    """
+    if not USE_EMBED_SERVICE or not hasattr(socket, "AF_UNIX") or not os.path.exists(EMBED_SOCKET):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(0.5)
+            conn.connect(EMBED_SOCKET)
+            conn.settimeout(30)
+            conn.sendall(json.dumps({"model": EMBED_MODEL, "texts": texts}).encode("utf-8") + b"\n")
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        reply = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    vectors = reply.get("vectors")
+    if not isinstance(vectors, list) or len(vectors) != len(texts):
+        return None
+    return vectors
+
+
+def fastembed_embed(texts):
+    texts = list(texts)
+    if not texts:
+        return []
+    remote = _embed_via_service(texts)
+    return remote if remote is not None else embed_locally(texts)
 
 
 def _tool_result_text(content):

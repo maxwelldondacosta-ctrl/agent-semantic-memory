@@ -19,15 +19,21 @@ Register it with:
       python3 "$PROJECT_ROOT/.claude/hooks/semantic-memory/memory_server.py"
 """
 
+import atexit
 import json
 import os
+import signal
+import socket
 import sys
+import threading
 import traceback
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 import indexer  # noqa: E402
+
+indexer.USE_EMBED_SERVICE = False
 
 SERVER_NAME = "semantic-memory"
 SERVER_VERSION = "0.3.0"
@@ -131,6 +137,104 @@ TOOLS = [
         },
     },
 ]
+
+
+class EmbedService:
+    """Serves this process's loaded model to the hooks over a Unix socket.
+
+    One JSON line in ({"model", "texts"}), one JSON line out ({"vectors"}).
+    The socket is created mode 0600. If another live server already owns
+    the path, this one stays out of the way; a stale file is replaced.
+    """
+
+    def __init__(self, path, embed=None):
+        self.path = path
+        self.embed = embed or indexer.embed_locally
+        self.lock = threading.Lock()
+        self.sock = None
+        self.inode = None
+
+    def _owned_elsewhere(self):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.3)
+                probe.connect(self.path)
+            return True
+        except OSError:
+            return False
+
+    def start(self):
+        if not hasattr(socket, "AF_UNIX"):
+            return False
+        if os.path.exists(self.path):
+            if self._owned_elsewhere():
+                return False
+            try:
+                os.unlink(self.path)
+            except OSError:
+                return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_umask = os.umask(0o177)
+        try:
+            sock.bind(self.path)
+        except OSError:
+            sock.close()
+            return False
+        finally:
+            os.umask(old_umask)
+        sock.listen(8)
+        self.sock = sock
+        self.inode = os.stat(self.path).st_ino
+        atexit.register(self.stop)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        return True
+
+    def stop(self):
+        if self.sock is None:
+            return
+        try:
+            self.sock.close()
+        finally:
+            self.sock = None
+        try:
+            if os.stat(self.path).st_ino == self.inode:
+                os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _accept_loop(self):
+        while self.sock is not None:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve_one, args=(conn,), daemon=True).start()
+
+    def _serve_one(self, conn):
+        with conn:
+            try:
+                conn.settimeout(30)
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    data += chunk
+                    if len(data) > 8_000_000:
+                        return
+                request = json.loads(data.decode("utf-8"))
+                if request.get("model") != indexer.EMBED_MODEL:
+                    reply = {"error": "model mismatch"}
+                else:
+                    texts = [str(text) for text in request.get("texts") or []]
+                    with self.lock:
+                        reply = {"vectors": self.embed(texts)}
+            except Exception as exc:
+                reply = {"error": str(exc)}
+            try:
+                conn.sendall(json.dumps(reply).encode("utf-8") + b"\n")
+            except OSError:
+                pass
 
 
 class MemoryServer:
@@ -268,6 +372,13 @@ class MemoryServer:
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
+def _warm_up():
+    try:
+        indexer.embed_locally(["warm up"])
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+
+
 def serve(stdin=sys.stdin, stdout=sys.stdout):
     server = MemoryServer()
     for line in stdin:
@@ -290,4 +401,8 @@ def serve(stdin=sys.stdin, stdout=sys.stdout):
 
 
 if __name__ == "__main__":
+    # Claude Code stops servers with SIGTERM; exit normally so atexit removes the socket.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    threading.Thread(target=_warm_up, daemon=True).start()
+    EmbedService(indexer.EMBED_SOCKET).start()
     serve()

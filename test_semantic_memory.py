@@ -677,6 +677,77 @@ class MemoryServerTests(unittest.TestCase):
         self.assertEqual(list(indexer.extract_messages(path)), [])
 
 
+@unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "needs Unix sockets")
+class EmbedServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "embed.sock")
+        self.calls = []
+
+        def fake(texts):
+            self.calls.append(list(texts))
+            return [[float(len(text)), 1.0] for text in texts]
+
+        self.fake = fake
+        self.patches = [
+            mock.patch.object(indexer, "EMBED_SOCKET", self.path),
+            mock.patch.object(indexer, "USE_EMBED_SERVICE", True),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def test_hooks_borrow_the_servers_model(self):
+        service = memory_server.EmbedService(self.path, self.fake)
+        self.assertTrue(service.start())
+        try:
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+            with mock.patch.object(indexer, "embed_locally", side_effect=AssertionError("loaded locally")):
+                vectors = indexer.fastembed_embed(["abc", "hello"])
+        finally:
+            service.stop()
+        self.assertEqual(vectors, [[3.0, 1.0], [5.0, 1.0]])
+        self.assertEqual(self.calls, [["abc", "hello"]])
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_falls_back_to_local_model_without_a_server(self):
+        with mock.patch.object(indexer, "embed_locally", return_value=[[9.0]]) as local:
+            self.assertEqual(indexer.fastembed_embed(["x"]), [[9.0]])
+        local.assert_called_once()
+
+    def test_stale_socket_file_is_replaced_and_live_one_is_left_alone(self):
+        stale = __import__("socket").socket(__import__("socket").AF_UNIX)
+        stale.bind(self.path)
+        stale.close()
+        first = memory_server.EmbedService(self.path, self.fake)
+        self.assertTrue(first.start())
+        second = memory_server.EmbedService(self.path, self.fake)
+        try:
+            self.assertFalse(second.start())
+            self.assertEqual(indexer.fastembed_embed(["ab"]), [[2.0, 1.0]])
+        finally:
+            second.stop()
+            first.stop()
+
+    def test_model_mismatch_is_refused(self):
+        import socket as socket_module
+        service = memory_server.EmbedService(self.path, self.fake)
+        service.start()
+        try:
+            with socket_module.socket(socket_module.AF_UNIX) as conn:
+                conn.connect(self.path)
+                conn.sendall(json.dumps({"model": "some/other-model", "texts": ["x"]}).encode() + b"\n")
+                reply = json.loads(conn.makefile().readline())
+        finally:
+            service.stop()
+        self.assertEqual(reply, {"error": "model mismatch"})
+        self.assertEqual(self.calls, [])
+
+
 try:
     import graphql  # noqa: F401
     import memory_graphql
