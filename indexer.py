@@ -691,24 +691,6 @@ def cosine_similarity(a, b):
     return dot / math.sqrt(na * nb)
 
 
-def _score_all(query, vectors):
-    try:
-        import numpy as np
-    except ImportError:
-        return [cosine_similarity(query, vec) for vec in vectors]
-    matrix = np.asarray(vectors, dtype=np.float32)
-    query_arr = np.asarray(query, dtype=np.float32)
-    if matrix.ndim != 2 or query_arr.shape[0] != matrix.shape[1]:
-        return [cosine_similarity(query, vec) for vec in vectors]
-    qnorm = np.linalg.norm(query_arr)
-    if qnorm:
-        query_arr = query_arr / qnorm
-    norms = np.linalg.norm(matrix, axis=1)
-    norms[norms == 0] = 1.0
-    matrix = matrix / norms[:, None]
-    return (matrix @ query_arr).tolist()
-
-
 def _diverse(candidates, k, max_similarity=0.85):
     """Highest-scoring hits, skipping near-copies of a hit already chosen.
 
@@ -800,6 +782,66 @@ def retrieve_with_ids(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45
     return _render_hits(db, chosen, exclude, context_window, max_chars, snippet_chars, header)
 
 
+def _load_matrix(db, dim, exclude, only, skip):
+    """(ids, uuids, sessions, matrix) for every usable row, rows L2-normalized.
+
+    Reads the float32 blobs straight into one numpy matrix; text is not
+    touched here, only fetched later for the few rows that score well.
+    Falls back to Python lists when numpy is missing.
+    """
+    width = dim * 4
+    ids, uuids, sessions, blobs = [], [], [], []
+    for row_id, msg_uuid, session_id, blob in db.execute(
+        "SELECT id, msg_uuid, session_id, vector FROM messages WHERE vector IS NOT NULL"
+    ):
+        if msg_uuid in exclude or session_id in skip:
+            continue
+        if only is not None and session_id not in only:
+            continue
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8")
+        if len(blob) != width or blob[:1] == b"[":
+            vec = unpack_vector(blob)
+            if not vec or len(vec) != dim:
+                continue
+            blob = array.array("f", vec).tobytes()
+        ids.append(row_id)
+        uuids.append(msg_uuid)
+        sessions.append(session_id)
+        blobs.append(blob)
+    if not ids:
+        return ids, uuids, sessions, None
+    try:
+        import numpy as np
+    except ImportError:
+        matrix = []
+        for blob in blobs:
+            values = array.array("f")
+            values.frombytes(blob)
+            matrix.append(list(values))
+        return ids, uuids, sessions, matrix
+    matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(ids), dim)
+    norms = np.linalg.norm(matrix, axis=1)
+    norms[norms == 0] = 1.0
+    return ids, uuids, sessions, matrix / norms[:, None]
+
+
+def _scores(matrix, query_vec):
+    if isinstance(matrix, list):
+        return [cosine_similarity(query_vec, vec) for vec in matrix]
+    import numpy as np
+    query = np.asarray(query_vec, dtype=np.float32)
+    qnorm = np.linalg.norm(query)
+    if qnorm:
+        query = query / qnorm
+    return matrix @ query
+
+
+def _row_vector(matrix, pos):
+    row = matrix[pos]
+    return row if isinstance(row, list) else row.tolist()
+
+
 def search_hits(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45, pool_size=24,
                 query_text=None, keyword_floor=0.55, relative_margin=None,
                 sessions=None, skip_sessions=None):
@@ -807,69 +849,84 @@ def search_hits(db, query_vec, exclude_uuids=None, top_k=4, threshold=0.45, pool
     exclude = set(exclude_uuids or ())
     only = set(sessions) if sessions else None
     skip = set(skip_sessions or ())
-    rows = db.execute(
-        """SELECT id, msg_uuid, session_id, role, timestamp, text, vector
-           FROM messages WHERE vector IS NOT NULL"""
-    ).fetchall()
-    usable = []
-    vectors = []
-    for row in rows:
-        if row[1] in exclude or row[2] in skip:
-            continue
-        if only is not None and row[2] not in only:
-            continue
-        vec = unpack_vector(row[6])
-        if not vec:
-            continue
-        usable.append(row)
-        vectors.append(vec)
-    if not usable:
+    dim = len(query_vec)
+    ids, uuids, row_sessions, matrix = _load_matrix(db, dim, exclude, only, skip)
+    if not ids:
         return []
 
-    scores = _score_all(query_vec, vectors)
-    by_id = {}
-    for score, row, vec in zip(scores, usable, vectors):
-        by_id[row[0]] = {
-            "score": score,
-            "id": row[0],
-            "uuid": row[1],
-            "session_id": row[2],
-            "role": row[3],
-            "timestamp": row[4],
-            "text": row[5],
-            "vec": vec,
-            "matched": [],
-        }
-    vector_order = sorted(by_id.values(), key=lambda item: item["score"], reverse=True)
-    vector_rank = {item["id"]: rank for rank, item in enumerate(vector_order)}
-
-    terms = keyword_terms(query_text) if query_text else []
-    keyword_ids = [row_id for row_id in keyword_search(db, terms) if row_id in by_id]
-    keyword_rank = {row_id: rank for rank, row_id in enumerate(keyword_ids)}
+    scores = _scores(matrix, query_vec)
+    order = sorted(range(len(ids)), key=lambda pos: -float(scores[pos])) \
+        if isinstance(scores, list) else (-scores).argsort(kind="stable").tolist()
+    vector_rank = {pos: rank for rank, pos in enumerate(order)}
+    pos_by_id = {row_id: pos for pos, row_id in enumerate(ids)}
 
     floor = threshold
     if relative_margin is not None:
-        floor = max(floor, vector_order[0]["score"] - relative_margin)
+        floor = max(floor, float(scores[order[0]]) - relative_margin)
+
+    terms = keyword_terms(query_text) if query_text else []
+    keyword_positions = [pos_by_id[row_id] for row_id in keyword_search(db, terms) if row_id in pos_by_id]
+    keyword_rank = {pos: rank for rank, pos in enumerate(keyword_positions)}
+
+    def fused(pos):
+        value = 1.0 / (RRF_K + vector_rank[pos])
+        if pos in keyword_rank:
+            value += 1.0 / (RRF_K + keyword_rank[pos])
+        return value
+
+    semantic = set()
+    for pos in order:
+        if float(scores[pos]) < floor:
+            break
+        semantic.add(pos)
+    pending = set(semantic) | set(keyword_positions)
+    if not pending:
+        return []
+    ranked = sorted(pending, key=fused, reverse=True)
+
+    details = {}
+    picked = ranked[: max(pool_size * 4, 64)]
+    for start in range(0, len(picked), 500):
+        batch = [ids[pos] for pos in picked[start:start + 500]]
+        marks = ",".join("?" * len(batch))
+        for row_id, role, timestamp, text in db.execute(
+            f"SELECT id, role, timestamp, text FROM messages WHERE id IN ({marks})", batch
+        ):
+            details[row_id] = (role, timestamp, text)
 
     candidates = []
-    for item in by_id.values():
-        admitted = item["score"] >= floor
-        if item["id"] in keyword_rank:
-            lowered = (item["text"] or "").lower()
-            item["matched"] = [term for term in terms if term.lower() in lowered]
-            if item["score"] >= keyword_floor or any(is_identifier(t) for t in item["matched"]):
+    for pos in picked:
+        row_id = ids[pos]
+        if row_id not in details:
+            continue
+        role, timestamp, text = details[row_id]
+        score = float(scores[pos])
+        matched = []
+        admitted = pos in semantic
+        if pos in keyword_rank:
+            lowered = (text or "").lower()
+            matched = [term for term in terms if term.lower() in lowered]
+            if score >= keyword_floor or any(is_identifier(t) for t in matched):
                 admitted = True
         if not admitted:
             continue
-        fused = 1.0 / (RRF_K + vector_rank[item["id"]])
-        if item["id"] in keyword_rank:
-            fused += 1.0 / (RRF_K + keyword_rank[item["id"]])
-        item["fused"] = fused
-        candidates.append(item)
+        candidates.append({
+            "score": score,
+            "id": row_id,
+            "uuid": uuids[pos],
+            "session_id": row_sessions[pos],
+            "role": role,
+            "timestamp": timestamp,
+            "text": text,
+            "vec": _row_vector(matrix, pos),
+            "matched": matched,
+            "fused": fused(pos),
+        })
+        if len(candidates) >= pool_size:
+            break
     if not candidates:
         return []
-    candidates.sort(key=lambda item: item["fused"], reverse=True)
-    return _diverse(candidates[:pool_size], top_k)
+    return _diverse(candidates, top_k)
 
 
 def _render_hits(db, chosen, exclude, context_window, max_chars, snippet_chars, header):

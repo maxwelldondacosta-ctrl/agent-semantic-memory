@@ -231,6 +231,28 @@ class RetrieveTests(unittest.TestCase):
         self.assertIn("no new dependency", text)
         self.assertNotIn("billing note", text)
 
+    def test_pure_python_fallback_ranks_like_numpy(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def no_numpy(name, *args, **kwargs):
+            if name == "numpy":
+                raise ImportError("numpy hidden for this test")
+            return real_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            self._insert(db, "near", "close match", [0.9, 0.1, 0.0], session="s1")
+            self._insert(db, "mid", "partial match", [0.6, 0.8, 0.0], session="s2")
+            self._insert(db, "far", "unrelated", [0.0, 0.0, 1.0], session="s3")
+            db.commit()
+            fast = [hit["uuid"] for hit in indexer.search_hits(db, [1, 0, 0], top_k=3, threshold=0.5)]
+            with mock.patch("builtins.__import__", no_numpy):
+                slow = [hit["uuid"] for hit in indexer.search_hits(db, [1, 0, 0], top_k=3, threshold=0.5)]
+            db.close()
+        self.assertEqual(fast, ["near", "mid"])
+        self.assertEqual(slow, fast)
+
     def test_char_budget_drops_a_block_instead_of_cutting_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = self._db(tmp)
