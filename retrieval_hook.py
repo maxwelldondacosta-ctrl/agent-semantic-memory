@@ -10,7 +10,7 @@ the new prompt and retrieves pre-compaction turns from this session, plus
 turns from other sessions, and passes a short excerpt as additionalContext.
 
 Claude Code contract:
-  stdin  -> JSON with at least {"user_prompt": "...", "transcript_path": "...", ...}
+  stdin  -> JSON with at least {"prompt": "...", "transcript_path": "...", "session_id": "...", ...}
   stdout -> {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                      "additionalContext": "..."}}
   exit 0 on success (even a no-op). Never blocks the prompt.
@@ -39,6 +39,17 @@ MIN_PROMPT_LEN = 8
 CONTEXT_WINDOW = 2
 MAX_INJECTED_CHARS = 3000
 LOG_PATH = os.path.join(SCRIPT_DIR, "semantic_memory.log")
+
+# Given once per session and compaction epoch: repeating it every turn
+# would pile up in the history, and compaction is what erases it.
+REMINDER_KEY = "__recall_reminder__"
+RECALL_REMINDER = (
+    "[Project semantic memory · note] Earlier sessions or compacted turns exist "
+    "that you cannot see. Before stating a project detail that is not visible above "
+    "(names, lore, stats, rules, earlier decisions), call the `recall` tool from the "
+    "semantic-memory server. If it finds no record, say so rather than guessing. "
+    "When the user settles a fact, store it with `remember`."
+)
 
 # Short or anaphoric prompts ("do that again") embed poorly on their own.
 # Fold in a little of the live tail so the query points at the real topic,
@@ -109,23 +120,26 @@ def main():
         log_failure(exc)
         sys.exit(0)
 
-    prompt = (payload.get("user_prompt") or "").strip()
+    # Claude Code sends `prompt`; `user_prompt` is kept for older test payloads.
+    prompt = (payload.get("prompt") or payload.get("user_prompt") or "").strip()
     transcript_path = payload.get("transcript_path")
 
     try:
         import indexer
 
         db = indexer.ensure_db()
-        if transcript_path and os.path.exists(transcript_path):
-            current = list(indexer.extract_messages(transcript_path))
-            pending = indexer.get_unindexed_messages(db, current)
-            if pending:
-                indexer.index_messages(db, pending)
+        indexer.refresh_transcript(db, transcript_path)
         live, epoch = indexer.live_context(transcript_path) if transcript_path else (set(), 0)
         session_key = payload.get("session_id") or (
             os.path.basename(transcript_path).replace(".jsonl", "") if transcript_path else ""
         )
         nudge = build_nudge(transcript_path, indexer.LARGE_TRANSCRIPT_BYTES) if transcript_path else None
+
+        reminder = None
+        if session_key and indexer.has_memory_beyond(db, live):
+            if REMINDER_KEY not in indexer.already_injected(db, session_key, epoch):
+                reminder = RECALL_REMINDER
+                indexer.record_injections(db, session_key, epoch, [REMINDER_KEY])
 
         context_text = None
         if len(prompt) >= MIN_PROMPT_LEN:
@@ -153,6 +167,8 @@ def main():
         sys.exit(0)
 
     pieces = []
+    if reminder:
+        pieces.append(reminder)
     if nudge:
         pieces.append(nudge)
     if context_text:

@@ -11,7 +11,9 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 import indexer
+import memory_server
 import retrieval_hook
+import verify_hook
 
 
 def _write_jsonl(path, records):
@@ -490,6 +492,234 @@ class IndexIncrementalTests(unittest.TestCase):
                 db.close()
             self.assertEqual(again, [])
             self.assertEqual(len(calls), 1)
+
+
+TOPICS = ("vargan", "rust parser", "billing", "sword", "colors")
+
+
+def topic_embed(texts):
+    """One axis per topic; text with no topic gets its own axis."""
+    vectors = []
+    for text in texts:
+        lowered = text.lower()
+        vec = [1.0 if topic in lowered else 0.0 for topic in TOPICS] + [0.0]
+        if not any(vec):
+            vec[-1] = 1.0
+        vectors.append(vec)
+    return vectors
+
+
+def _run_main(module, payload):
+    stdout = io.StringIO()
+    with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+        with redirect_stdout(stdout):
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                try:
+                    module.main()
+                except SystemExit as exc:
+                    assert exc.code == 0, exc.code
+    raw = stdout.getvalue()
+    return json.loads(raw)["hookSpecificOutput"]["additionalContext"] if raw.strip() else None
+
+
+class PromptFieldAndReminderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        indexer.INDEX_DB = os.path.join(self.tmp.name, "semantic_memory.db")
+        past = os.path.join(self.tmp.name, "past.jsonl")
+        _write_jsonl(past, [_user("p1", "Vargan the boss has 300 HP and fears fire", session="past")])
+        db = indexer.ensure_db()
+        with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            indexer.refresh_transcript(db, past)
+        db.close()
+        self.transcript = os.path.join(self.tmp.name, "cur.jsonl")
+        _write_jsonl(self.transcript, [_user("c1", "let's work on level two", session="cur")])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_claude_code_prompt_field_drives_retrieval(self):
+        body = _run_main(retrieval_hook, {
+            "prompt": "how much HP does Vargan have",
+            "transcript_path": self.transcript,
+            "session_id": "cur",
+        })
+        self.assertIn("300 HP", body)
+
+    def test_recall_reminder_is_given_once_per_epoch(self):
+        payload = {"prompt": "add a new enemy type", "transcript_path": self.transcript, "session_id": "cur"}
+        first = _run_main(retrieval_hook, payload)
+        second = _run_main(retrieval_hook, payload)
+        with open(self.transcript, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+        third = _run_main(retrieval_hook, payload)
+        self.assertIn("call the `recall` tool", first)
+        self.assertIsNone(second)
+        self.assertIn("call the `recall` tool", third)
+
+
+class MemoryServerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        indexer.INDEX_DB = os.path.join(self.tmp.name, "semantic_memory.db")
+        self.dir_patch = mock.patch.object(indexer, "TRANSCRIPTS_DIR", self.tmp.name)
+        self.embed_patch = mock.patch.object(indexer, "fastembed_embed", topic_embed)
+        self.dir_patch.start()
+        self.embed_patch.start()
+        _write_jsonl(os.path.join(self.tmp.name, "s1.jsonl"), [
+            _user("u1", "the rust parser is pinned to 0.9", session="s1"),
+        ])
+        _write_jsonl(os.path.join(self.tmp.name, "s3.jsonl"), [
+            _user("u2", "billing page uses the new colors", session="s3"),
+        ])
+        self.server = memory_server.MemoryServer()
+
+    def tearDown(self):
+        self.embed_patch.stop()
+        self.dir_patch.stop()
+        self.tmp.cleanup()
+
+    def _call(self, name, **arguments):
+        response = self.server.handle({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+        result = response["result"]
+        return result["content"][0]["text"], result["isError"]
+
+    def test_protocol_handshake_and_listing(self):
+        init = self.server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"},
+        })
+        self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+        self.assertIn("tools", init["result"]["capabilities"])
+        self.assertIsNone(self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        names = [tool["name"] for tool in self.server.handle(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        )["result"]["tools"]]
+        self.assertEqual(names, ["recall", "remember", "forget"])
+        missing = self.server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})
+        self.assertEqual(missing["error"]["code"], -32601)
+
+    def test_serve_loop_speaks_newline_json(self):
+        stdin = io.StringIO(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+            + "not json\n"
+        )
+        stdout = io.StringIO()
+        memory_server.serve(stdin, stdout)
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(lines[0], {"jsonrpc": "2.0", "id": 1, "result": {}})
+        self.assertEqual(lines[1]["error"]["code"], -32700)
+        self.assertEqual(len(lines), 2)
+
+    def test_recall_indexes_recent_transcripts_and_finds_the_turn(self):
+        text, is_error = self._call("recall", query="which rust parser version")
+        self.assertFalse(is_error)
+        self.assertIn("pinned to 0.9", text)
+        self.assertNotIn("new colors", text)
+
+    def test_recall_says_no_record_instead_of_guessing(self):
+        text, is_error = self._call("recall", query="what is the name of the dragon")
+        self.assertFalse(is_error)
+        self.assertIn("No record found", text)
+        self.assertIn("Do not fill the gap with a guess", text)
+
+    def test_remember_replaces_same_topic_and_is_marked_canon(self):
+        self._call("remember", fact="Vargan has 300 HP", topic="Vargan stats")
+        text, _ = self._call("remember", fact="Vargan has 450 HP after the rebalance", topic="Vargan stats")
+        self.assertIn("Replaced previous entry", text)
+        self.assertIn("300 HP", text)
+        recalled, _ = self._call("recall", query="Vargan hit points")
+        self.assertIn("CANON", recalled)
+        self.assertIn("450 HP", recalled)
+        self.assertNotIn("Vargan has 300 HP", recalled)
+        removed, _ = self._call("forget", topic="Vargan stats")
+        self.assertIn("Removed", removed)
+        gone, _ = self._call("recall", query="Vargan hit points")
+        self.assertIn("No record found", gone)
+
+    def test_recall_output_is_not_reindexed_as_a_tool_result(self):
+        recalled, _ = self._call("recall", query="which rust parser version")
+        path = os.path.join(self.tmp.name, "s2.jsonl")
+        _write_jsonl(path, [{
+            "type": "user", "uuid": "tr", "sessionId": "s2",
+            "message": {"role": "user", "content": [{"type": "tool_result", "content": recalled[:500]}]},
+        }])
+        self.assertEqual(list(indexer.extract_messages(path)), [])
+
+
+class VerifyHookTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        indexer.INDEX_DB = os.path.join(self.tmp.name, "semantic_memory.db")
+        db = indexer.ensure_db()
+        with mock.patch.object(indexer, "fastembed_embed", topic_embed):
+            indexer.remember_fact(db, "Vargan has 450 HP and is weak to ice", "Vargan stats")
+        db.close()
+        self.transcript = os.path.join(self.tmp.name, "cur.jsonl")
+        _write_jsonl(self.transcript, [_user("c1", "make the boss fight harder", session="cur")])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _payload(self, reply, active=False):
+        return {
+            "last_assistant_message": reply,
+            "stop_hook_active": active,
+            "transcript_path": self.transcript,
+            "session_id": "cur",
+        }
+
+    def test_claims_are_past_references_and_hedges_outside_code(self):
+        reply = (
+            "Here is the plan.\n"
+            "As we decided earlier, Vargan has 300 HP.\n"
+            "I think his weakness is fire.\n"
+            "```python\n# previously we decided nothing\n```\n"
+            "The new attack deals 40 damage."
+        )
+        claims = verify_hook.memory_claims(reply)
+        self.assertEqual(len(claims), 2)
+        self.assertIn("Vargan has 300 HP", claims[0])
+        self.assertIn("weakness is fire", claims[1])
+
+    def test_confident_wrong_recall_gets_checked_against_canon(self):
+        body = _run_main(verify_hook, self._payload(
+            "As we established, Vargan has 300 HP, so I bumped his attack instead."
+        ))
+        self.assertIn("relied on remembered context", body)
+        self.assertIn("CANON", body)
+        self.assertIn("450 HP", body)
+        self.assertIn("tell the user plainly", body)
+
+    def test_admitting_no_memory_also_triggers_a_lookup(self):
+        body = _run_main(verify_hook, self._payload(
+            "I don't remember how much HP Vargan has, so I left it unchanged."
+        ))
+        self.assertIn("450 HP", body)
+
+    def test_silent_when_already_continuing_or_nothing_to_check(self):
+        self.assertIsNone(_run_main(verify_hook, self._payload(
+            "As we established, Vargan has 300 HP.", active=True
+        )))
+        self.assertIsNone(_run_main(verify_hook, self._payload("Added the new attack animation.")))
+        self.assertIsNone(_run_main(verify_hook, self._payload(
+            "I think the sword sprite should be bigger."
+        )))
+
+    def test_same_records_are_not_pushed_twice_in_one_epoch(self):
+        reply = "As we decided, Vargan has 300 HP."
+        self.assertIsNotNone(_run_main(verify_hook, self._payload(reply)))
+        self.assertIsNone(_run_main(verify_hook, self._payload(reply)))
+
+    def test_records_recalled_by_the_tool_are_not_repeated(self):
+        db = indexer.ensure_db()
+        indexer.record_recalls(db, ["canon:vargan-stats"])
+        db.close()
+        self.assertIsNone(_run_main(verify_hook, self._payload("As we decided, Vargan has 300 HP.")))
 
 
 if __name__ == "__main__":
