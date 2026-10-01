@@ -1,106 +1,113 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook: incrementally indexes the current session's new
-turns, then injects retrieved context from this project's semantic memory
-index before each turn.
+UserPromptSubmit hook: incrementally indexes the current session, then
+injects raw turns that are *not* already in the model's live context.
+
+Claude Code keeps everything after the last compact_boundary in the prompt
+and replaces everything before it with a summary. Re-injecting the hot zone
+only burns the context budget on text the model just saw. This hook embeds
+the new prompt and retrieves pre-compaction turns from this session, plus
+turns from other sessions, and passes a short excerpt as additionalContext.
 
 Claude Code contract:
-  stdin  -> JSON with at least {"user_prompt": "...", "transcript_path": "...", ...}
+  stdin  -> JSON with at least {"prompt": "...", "transcript_path": "...", "session_id": "...", ...}
   stdout -> {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                      "additionalContext": "..."}}
   exit 0 on success (even a no-op). Never blocks the prompt.
 
-Runs on every message. Only the current session's transcript file is
-re-scanned each time (fast — indexer.py's dedup by msg_uuid makes repeat
-scans of already-indexed turns a no-op), not the whole project history.
-
-Fails silent and fast on any error — this must never break a real prompt.
+Only the current session file is re-scanned. Dedup is by message UUID and
+chunk index. Failures are logged and swallowed — a retrieval bug must never
+break a real prompt.
 """
 
 import json
-import math
 import os
-import sqlite3
+import re
 import sys
+import traceback
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 TOP_K = 4
-SCORE_THRESHOLD = 0.45
+# Measured on bge-small-en-v1.5 with the query prefix: related turns land
+# around 0.65-0.80, unrelated ones up to ~0.59.
+SCORE_THRESHOLD = 0.62
+RELATIVE_MARGIN = 0.10
+KEYWORD_FLOOR = 0.55
 MIN_PROMPT_LEN = 8
 CONTEXT_WINDOW = 2
 MAX_INJECTED_CHARS = 3000
+LOG_PATH = os.path.join(SCRIPT_DIR, "semantic_memory.log")
 
-# Transcript-size nudge: this hook only exists in projects with semantic
-# indexing wired up, so a /clear suggestion here is always safe — retrieval
-# backfills anything relevant on the next message. No auto-compact threshold
-# knob exists in Claude Code itself, so this is a soft nudge, not a hard cap.
-NUDGE_THRESHOLD_BYTES = 2_000_000  # ~2MB transcript
+# Given once per session and compaction epoch: repeating it every turn
+# would pile up in the history, and compaction is what erases it.
+REMINDER_KEY = "__recall_reminder__"
+RECALL_REMINDER = (
+    "[Project semantic memory · note] Earlier sessions or compacted turns exist "
+    "that you cannot see. Before stating a project detail that is not visible above "
+    "(names, lore, stats, rules, earlier decisions), call the `recall` tool from the "
+    "semantic-memory server. If it finds no record, say so rather than guessing. "
+    "When the user settles a fact, store it with `remember`."
+)
+
+# Short or anaphoric prompts ("do that again") embed poorly on their own.
+# Fold in a little of the live tail so the query points at the real topic,
+# while retrieval still refuses to echo that tail back.
+_ANAPHORA = re.compile(
+    r"\b(it|that|this|those|them|same|again|previous|above|continue)\b",
+    re.IGNORECASE,
+)
 
 
-def build_nudge(transcript_path):
+def log_failure(exc):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            handle.write("\n")
+    except Exception:
+        pass
+
+
+def build_nudge(transcript_path, threshold):
     try:
         size = os.path.getsize(transcript_path)
     except OSError:
         return None
-    if size < NUDGE_THRESHOLD_BYTES:
+    if size < threshold:
         return None
     return (
         f"[System note: this session's transcript is large ({size / 1_000_000:.1f}MB). "
-        "Semantic memory indexing is active for this project, so running /clear now "
-        "would be safe — relevant history stays retrievable on demand. If a natural "
-        "task boundary has been reached, consider proactively suggesting /clear to "
-        "the user rather than carrying the full transcript forward.]"
+        "Semantic memory is active, so running /clear is safe — turns that fall out "
+        "of the live prompt stay retrievable. If a task boundary has been reached, "
+        "suggest /clear rather than carrying the full transcript forward.]"
     )
 
 
-def cosine_similarity(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
+def _hot_zone_tail(transcript_path, exclude_uuids, limit=2, chars=300):
+    """Recent live turns, used only to disambiguate the query — never injected."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+    import indexer
+    texts = []
+    for _uuid, _session, role, _ts, text in indexer.extract_messages(transcript_path):
+        if _uuid not in exclude_uuids:
+            continue
+        snippet = " ".join(text.split())
+        if len(snippet) > chars:
+            snippet = snippet[:chars]
+        texts.append(f"[{role}] {snippet}")
+    return "\n".join(texts[-limit:])
 
 
-def retrieve(db, query_vec):
-    rows = db.execute(
-        "SELECT id, session_id, role, text, timestamp, vector FROM messages WHERE vector IS NOT NULL"
-    ).fetchall()
-    if not rows:
-        return None
-
-    scored = []
-    for row in rows:
-        vec = json.loads(row[5])
-        sim = cosine_similarity(query_vec, vec)
-        if sim >= SCORE_THRESHOLD:
-            scored.append((sim, row[0], row[1], row[2], row[3]))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:TOP_K]
-    if not top:
-        return None
-
-    seen = set()
-    context_msgs = []
-    for sim, vid, session_id, role, text in top:
-        before = db.execute(
-            "SELECT role, text, id FROM messages WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?",
-            (session_id, vid, CONTEXT_WINDOW),
-        ).fetchall()
-        after = db.execute(
-            "SELECT role, text, id FROM messages WHERE session_id=? AND id>? ORDER BY id ASC LIMIT ?",
-            (session_id, vid, CONTEXT_WINDOW),
-        ).fetchall()
-        window = list(reversed(before)) + [(role, text, vid)] + list(after)
-        for r_role, r_text, r_id in window:
-            if r_id not in seen:
-                seen.add(r_id)
-                context_msgs.append((r_id, r_role, r_text))
-
-    context_msgs.sort(key=lambda x: x[0])
-    parts = [f"[{role}] {text[:500]}" for _id, role, text in context_msgs]
-    return "\n\n".join(parts)[:MAX_INJECTED_CHARS]
+def build_query(prompt, transcript_path, exclude_uuids):
+    import indexer
+    body = prompt
+    if len(prompt) < 80 or _ANAPHORA.search(prompt):
+        tail = _hot_zone_tail(transcript_path, exclude_uuids)
+        if tail and tail not in prompt:
+            body = "Recent live context:\n" + tail + "\n\nCurrent request:\n" + prompt
+    return indexer.QUERY_PREFIX + body
 
 
 def main():
@@ -109,48 +116,73 @@ def main():
         if not raw.strip():
             sys.exit(0)
         payload = json.loads(raw)
-        prompt = (payload.get("user_prompt") or "").strip()
-        transcript_path = payload.get("transcript_path")
+    except Exception as exc:
+        log_failure(exc)
+        sys.exit(0)
 
-        import indexer  # local module, same dir
+    # Claude Code sends `prompt`; `user_prompt` is kept for older test payloads.
+    prompt = (payload.get("prompt") or payload.get("user_prompt") or "").strip()
+    transcript_path = payload.get("transcript_path")
+
+    try:
+        import indexer
 
         db = indexer.ensure_db()
+        indexer.refresh_transcript(db, transcript_path)
+        live, epoch = indexer.live_context(transcript_path) if transcript_path else (set(), 0)
+        session_key = payload.get("session_id") or (
+            os.path.basename(transcript_path).replace(".jsonl", "") if transcript_path else ""
+        )
+        nudge = build_nudge(transcript_path, indexer.LARGE_TRANSCRIPT_BYTES) if transcript_path else None
 
-        # Incrementally index just the current session's transcript — fast,
-        # dedup'd by msg_uuid, keeps the index fresh every single turn.
-        if transcript_path and os.path.exists(transcript_path):
-            current_msgs = list(indexer.extract_messages(transcript_path))
-            to_index = indexer.get_unindexed_messages(db, current_msgs)
-            if to_index:
-                indexer.index_messages(db, to_index)
-
-        nudge = build_nudge(transcript_path) if transcript_path else None
+        reminder = None
+        if session_key and indexer.has_memory_beyond(db, live):
+            if REMINDER_KEY not in indexer.already_injected(db, session_key, epoch):
+                reminder = RECALL_REMINDER
+                indexer.record_injections(db, session_key, epoch, [REMINDER_KEY])
 
         context_text = None
         if len(prompt) >= MIN_PROMPT_LEN:
-            query_vec = indexer.fastembed_embed([prompt])[0]
-            context_text = retrieve(db, query_vec)
+            # Earlier injections this epoch are still in the prompt as hook context.
+            exclude = live | indexer.already_injected(db, session_key, epoch)
+            query = build_query(prompt, transcript_path, live)
+            query_vec = indexer.fastembed_embed([query])[0]
+            context_text, injected = indexer.retrieve_with_ids(
+                db,
+                query_vec,
+                exclude_uuids=exclude,
+                top_k=TOP_K,
+                threshold=SCORE_THRESHOLD,
+                context_window=CONTEXT_WINDOW,
+                max_chars=MAX_INJECTED_CHARS,
+                query_text=prompt,
+                keyword_floor=KEYWORD_FLOOR,
+                relative_margin=RELATIVE_MARGIN,
+            )
+            if injected and session_key:
+                indexer.record_injections(db, session_key, epoch, injected)
         db.close()
-
-        pieces = []
-        if nudge:
-            pieces.append(nudge)
-        if context_text:
-            pieces.append(f"[Project Semantic Memory — relevant past context]\n{context_text}")
-
-        if not pieces:
-            sys.exit(0)
-
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": "\n\n".join(pieces),
-            }
-        }))
+    except Exception as exc:
+        log_failure(exc)
         sys.exit(0)
-    except Exception:
-        # Never break the user's prompt over a retrieval/indexing failure.
+
+    pieces = []
+    if reminder:
+        pieces.append(reminder)
+    if nudge:
+        pieces.append(nudge)
+    if context_text:
+        pieces.append(context_text)
+    if not pieces:
         sys.exit(0)
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "\n\n".join(pieces),
+        }
+    }))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

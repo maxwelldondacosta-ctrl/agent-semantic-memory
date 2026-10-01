@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 semantic_memory.db
+semantic_memory.db-wal
+semantic_memory.db-shm
+semantic_memory.log
