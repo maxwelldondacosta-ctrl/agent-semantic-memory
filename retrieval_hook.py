@@ -30,7 +30,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 TOP_K = 4
-SCORE_THRESHOLD = 0.45
+# Measured on bge-small-en-v1.5 with the query prefix: related turns land
+# around 0.65-0.80, unrelated ones up to ~0.59.
+SCORE_THRESHOLD = 0.62
+RELATIVE_MARGIN = 0.10
+KEYWORD_FLOOR = 0.55
 MIN_PROMPT_LEN = 8
 CONTEXT_WINDOW = 2
 MAX_INJECTED_CHARS = 3000
@@ -117,14 +121,19 @@ def main():
             pending = indexer.get_unindexed_messages(db, current)
             if pending:
                 indexer.index_messages(db, pending)
-        exclude = indexer.live_context_uuids(transcript_path) if transcript_path else set()
+        live, epoch = indexer.live_context(transcript_path) if transcript_path else (set(), 0)
+        session_key = payload.get("session_id") or (
+            os.path.basename(transcript_path).replace(".jsonl", "") if transcript_path else ""
+        )
         nudge = build_nudge(transcript_path, indexer.LARGE_TRANSCRIPT_BYTES) if transcript_path else None
 
         context_text = None
         if len(prompt) >= MIN_PROMPT_LEN:
-            query = build_query(prompt, transcript_path, exclude)
+            # Earlier injections this epoch are still in the prompt as hook context.
+            exclude = live | indexer.already_injected(db, session_key, epoch)
+            query = build_query(prompt, transcript_path, live)
             query_vec = indexer.fastembed_embed([query])[0]
-            context_text = indexer.retrieve(
+            context_text, injected = indexer.retrieve_with_ids(
                 db,
                 query_vec,
                 exclude_uuids=exclude,
@@ -132,7 +141,12 @@ def main():
                 threshold=SCORE_THRESHOLD,
                 context_window=CONTEXT_WINDOW,
                 max_chars=MAX_INJECTED_CHARS,
+                query_text=prompt,
+                keyword_floor=KEYWORD_FLOOR,
+                relative_margin=RELATIVE_MARGIN,
             )
+            if injected and session_key:
+                indexer.record_injections(db, session_key, epoch, injected)
         db.close()
     except Exception as exc:
         log_failure(exc)

@@ -61,6 +61,22 @@ huge and the marker is missing, only the recent tail is treated as live.
 The compact summary itself is not indexed. It is already in the hot zone,
 and storing the paraphrase would compete with the raw turns it replaced.
 
+Earlier injections count as seen too. Hook context stays in the prompt
+until the next compaction, so every excerpt the hook shows is recorded
+per session and compaction epoch and skipped until a new
+`compact_boundary` appears. Without that, a topic you keep working on
+would re-inject the same excerpt on every turn.
+
+### Meaning and exact names
+
+Embeddings are good at "how do jobs avoid running twice" and bad at
+`export_rows`, `E1042` or `src/net/http.py`. Those exact identifiers are
+often what the question is about. Every chunk is also in a SQLite FTS5
+keyword index, and the two rankings are merged with reciprocal rank
+fusion. A keyword-only hit needs a moderate semantic score, unless the
+matching term looks like an identifier, so one shared common word is not
+enough.
+
 The same design generalizes to any agent framework with a pre-prompt /
 pre-LLM-call hook — the only framework-specific parts are the input/output
 contract (what shape the hook receives on stdin, what shape it must return)
@@ -112,10 +128,12 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
 
 ## How it works
 
-- **Storage**: `semantic_memory.db` — SQLite (WAL), one `messages` table
-  (uuid, chunk index, session id, role, timestamp, text, float32 vector,
-  indexed_at). Project-local, not shared across projects. An older JSON-vector
-  database is migrated on open.
+- **Storage**: `semantic_memory.db` — SQLite (WAL). `messages` holds
+  uuid, chunk index, session id, role, timestamp, text, float32 vector and
+  indexed_at. `messages_fts` is the trigger-synced keyword index, and
+  `injections` records what was shown per session and compaction epoch.
+  Project-local, not shared across projects. An older database is migrated
+  and backfilled on open.
 - **Transcript source**: Claude Code's own session transcripts at
   `~/.claude/projects/<encoded-project-path>/*.jsonl`. The extractor reads
   `type: "user"` / `"assistant"` text, plus short tool results (errors and
@@ -125,12 +143,24 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
   overlapping windows so the tail of a long message is still findable.
   The stored text is the raw slice, not a paraphrase.
 - **Retrieval**: normalized cosine similarity over the float32 matrix
-  (numpy when it is installed, which it is via fastembed). Top matches
-  above 0.45, diversified so four near-copies of the same turn do not fill
-  the budget, ±2 neighboring messages from the *same* session, capped at
-  ~3000 characters. Queries get the BGE retrieval prefix. A short or
+  (numpy when it is installed, which it is via fastembed), fused with BM25
+  from the FTS5 index. A semantic hit must score at least 0.62 and come
+  within 0.10 of the query's best match. A keyword hit must score at least
+  0.55, unless the term looks like an identifier. Hits are diversified so
+  near-copies of one turn do not fill the budget, shown with ±2 neighboring
+  messages from the *same* session, and capped at ~3000 characters. A
+  snippet is centered on the matched keyword when that keyword sits deep
+  in a long chunk. Queries get the BGE retrieval prefix. A short or
   anaphoric prompt ("do that again") is embedded together with the live
   tail so the query has a topic, but that tail is not injected.
+- **Thresholds**: bge-small rarely scores unrelated text below 0.4, and
+  in a sample project unrelated turns reached 0.59 while relevant ones
+  scored 0.65–0.80. The old 0.45 cutoff injected noise on nearly every
+  prompt. If you change the model, re-measure these values
+  (`SCORE_THRESHOLD`, `RELATIVE_MARGIN`, `KEYWORD_FLOOR` in
+  `retrieval_hook.py`).
+- **Latency**: about 0.65 s per prompt on a small index, almost all of it
+  loading the ONNX model in a fresh process.
 - **Nudge threshold**: 2MB transcript file size (`LARGE_TRANSCRIPT_BYTES`
   in `indexer.py`). The same threshold is the fallback for "no compact
   boundary, but this file is too big to treat as fully live."
@@ -158,6 +188,10 @@ Should exit 0. When the index has a match outside the live transcript, stdout is
 - After changing chunk size, run `indexer.py --reindex`. Ordinary new turns
   are picked up incrementally, and a message is re-embedded when its stored
   chunk count no longer matches.
+- Skipping repeat injections assumes Claude Code keeps earlier
+  `additionalContext` in the conversation until compaction. If you start a
+  new session with `/clear`, its session id changes, so recall starts fresh.
+  To reset by hand, `DELETE FROM injections`.
 - Injected excerpts are framed as reference. They are past transcript text,
   not new instructions, and the hook says so in the context header.
 - If `python3` on `PATH` doesn't have `fastembed` installed (e.g. system

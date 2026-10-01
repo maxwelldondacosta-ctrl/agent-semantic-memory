@@ -245,7 +245,134 @@ class RetrieveTests(unittest.TestCase):
         self.assertFalse(text.endswith("…"))
 
 
+class KeywordTests(unittest.TestCase):
+    def _db(self, tmp):
+        indexer.INDEX_DB = os.path.join(tmp, "semantic_memory.db")
+        return indexer.ensure_db()
+
+    def _insert(self, db, uuid, text, vec, session="s"):
+        db.execute(
+            """INSERT INTO messages
+               (msg_uuid, chunk_index, session_id, role, timestamp, text, vector, indexed_at)
+               VALUES (?, 0, ?, 'user', 't', ?, ?, 1)""",
+            (uuid, session, text, indexer.pack_vector(vec)),
+        )
+
+    def test_keyword_terms_keep_identifiers_and_drop_stopwords(self):
+        terms = indexer.keyword_terms("why does parse_header() fail in src/net/http.py with E1042?")
+        self.assertIn("parse_header", terms)
+        self.assertIn("src/net/http.py", terms)
+        self.assertIn("E1042", terms)
+        self.assertNotIn("why", terms)
+        self.assertNotIn("does", terms)
+
+    def test_identifier_match_is_recalled_below_the_vector_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            self._insert(db, "hit", "parse_header() drops the trailing CRLF, fixed with rstrip", [0.1, 1.0])
+            self._insert(db, "noise", "unrelated discussion about colors", [0.0, 1.0], session="other")
+            db.commit()
+            vector_only = indexer.retrieve(db, [1.0, 0.0], threshold=0.45)
+            hybrid = indexer.retrieve(
+                db, [1.0, 0.0], threshold=0.45,
+                query_text="what was wrong with parse_header again",
+            )
+            db.close()
+        self.assertIsNone(vector_only)
+        self.assertIn("parse_header() drops the trailing CRLF", hybrid)
+        self.assertIn("keyword parse_header", hybrid)
+        self.assertNotIn("colors", hybrid)
+
+    def test_common_word_alone_does_not_admit_an_unrelated_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            self._insert(db, "noise", "the release notes mention a parser", [0.0, 1.0])
+            db.commit()
+            text = indexer.retrieve(db, [1.0, 0.0], threshold=0.45, query_text="write release notes")
+            db.close()
+        self.assertIsNone(text)
+
+    def test_fts_follows_upserts_and_deletes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            with mock.patch.object(indexer, "fastembed_embed", lambda texts: [[1.0, 0.0] for _ in texts]):
+                indexer.index_messages(db, [("u", 0, "s", "user", "t", "alpha_token here")])
+                self.assertEqual(len(indexer.keyword_search(db, ["alpha_token"])), 1)
+                indexer.index_messages(db, [("u", 0, "s", "user", "t", "beta_token now")])
+            self.assertEqual(indexer.keyword_search(db, ["alpha_token"]), [])
+            self.assertEqual(len(indexer.keyword_search(db, ["beta_token"])), 1)
+            db.execute("DELETE FROM messages")
+            db.commit()
+            self.assertEqual(indexer.keyword_search(db, ["beta_token"]), [])
+            db.close()
+
+    def test_existing_rows_are_backfilled_into_a_new_fts_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            self._insert(db, "u", "gamma_token lives here", [1.0, 0.0])
+            db.commit()
+            db.executescript("""
+                DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad;
+                DROP TRIGGER messages_fts_au; DROP TABLE messages_fts;
+            """)
+            db.close()
+            db = indexer.ensure_db()
+            self.assertEqual(len(indexer.keyword_search(db, ["gamma_token"])), 1)
+            db.close()
+
+    def test_snippet_centers_on_a_late_keyword(self):
+        text = "x " * 600 + "the culprit was FOO_BAR_9 in config"
+        snippet = indexer._focused_snippet(text, ["FOO_BAR_9"], 200)
+        self.assertIn("FOO_BAR_9", snippet)
+        self.assertLessEqual(len(snippet), 204)
+
+
 class HookTests(unittest.TestCase):
+    def _run_hook(self, payload, fake_embed):
+        stdout = io.StringIO()
+        with mock.patch.object(indexer, "fastembed_embed", fake_embed):
+            with redirect_stdout(stdout):
+                with self.assertRaises(SystemExit) as raised:
+                    with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                        retrieval_hook.main()
+        self.assertEqual(raised.exception.code, 0)
+        raw = stdout.getvalue()
+        return json.loads(raw)["hookSpecificOutput"]["additionalContext"] if raw.strip() else None
+
+    def test_same_excerpt_is_not_reinjected_until_the_next_compaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            indexer.INDEX_DB = os.path.join(tmp, "semantic_memory.db")
+            other = os.path.join(tmp, "past.jsonl")
+            _write_jsonl(other, [_user("past", "we pinned the rust parser to 0.9", session="past")])
+            transcript = os.path.join(tmp, "current.jsonl")
+            _write_jsonl(transcript, [_user("live", "hello there", session="current")])
+
+            def fake_embed(texts):
+                return [[1.0, 0.0] if "rust parser" in t else [0.0, 1.0] for t in texts]
+
+            with mock.patch.object(indexer, "fastembed_embed", fake_embed):
+                db = indexer.ensure_db()
+                indexer.index_messages(db, indexer.get_unindexed_messages(
+                    db, list(indexer.extract_messages(other))
+                ))
+                db.close()
+
+            payload = {
+                "user_prompt": "which rust parser version did we pin",
+                "transcript_path": transcript,
+                "session_id": "current",
+            }
+            first = self._run_hook(payload, fake_embed)
+            second = self._run_hook(payload, fake_embed)
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+            third = self._run_hook(payload, fake_embed)
+
+        self.assertIn("pinned the rust parser", first)
+        self.assertIsNone(second)
+        self.assertIn("pinned the rust parser", third)
+
+
     def test_hook_injects_archived_match_not_the_hot_zone(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "semantic_memory.db")
